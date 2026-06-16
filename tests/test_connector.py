@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 import snowflake.sqlalchemy.custom_types as sct
 from sqlalchemy import types
 
+import target_snowflake.connector as connector_module
 from target_snowflake.connector import SnowflakeConnector, SnowflakeTimestampType
 from target_snowflake.snowflake_types import NUMBER, VARIANT
 
@@ -104,3 +107,84 @@ def test_singer_decimal(connector: SnowflakeConnector):
     assert isinstance(sql_type, types.DECIMAL)
     assert sql_type.precision == 38
     assert sql_type.scale == 18
+
+
+def _oauth_connector(database: str = "CUSTOMER_DB") -> SnowflakeConnector:
+    """OAuth-configured connector."""
+    return SnowflakeConnector(
+        config={
+            "account": "lzc69188.us-east-1",
+            "user": "u",
+            "database": database,
+            "warehouse": "COMPUTE_WH",
+            "role": "PUBLIC",
+            "oauth_access_token": "tok",
+        },
+    )
+
+
+def _capture_connect_listener(connector: SnowflakeConnector) -> dict:
+    """Run create_engine with sqlalchemy.create_engine + the connect-event
+    registration stubbed, so it doesn't need a live Snowflake (the SHOW
+    DATABASES validation is fed a mock row). Returns the captured listener.
+    """
+    captured: dict = {}
+
+    def fake_listens_for(target, identifier):  # noqa: ANN001, ANN202
+        def deco(fn):  # noqa: ANN001, ANN202
+            captured["identifier"] = identifier
+            captured["fn"] = fn
+            return fn
+
+        return deco
+
+    mock_engine = MagicMock()
+    mock_engine.dialect.ischema_names = {}
+    mock_engine.dialect.colspecs = {}
+    # create_engine validates the database via SHOW DATABASES; db[1] is the name.
+    rows = [("created_on", connector.config["database"])]
+    mock_engine.connect.return_value.__enter__.return_value.execute.return_value.fetchall.return_value = rows
+
+    with (
+        patch.object(connector_module.sqlalchemy, "create_engine", return_value=mock_engine),
+        patch.object(connector_module.sqlalchemy.event, "listens_for", side_effect=fake_listens_for),
+    ):
+        engine = connector.create_engine()
+
+    assert engine is mock_engine
+    return captured
+
+
+def test_connect_listener_issues_use_database():
+    """Every pooled connection must run an explicit `USE DATABASE` so the
+    session has a current database. Role-scoped OAuth tokens carry no default
+    namespace, so without this the unqualified `CREATE TABLE` this target
+    emits fails with `090105: ... does not have a current database`."""
+    connector = _oauth_connector(database="CUSTOMER_DB")
+    captured = _capture_connect_listener(connector)
+
+    assert captured["identifier"] == "connect"
+
+    cursor = MagicMock()
+    dbapi_connection = MagicMock()
+    dbapi_connection.cursor.return_value = cursor
+
+    captured["fn"](dbapi_connection, MagicMock())
+
+    cursor.execute.assert_called_once_with('USE DATABASE "CUSTOMER_DB"')
+    cursor.close.assert_called_once()
+
+
+def test_connect_listener_quotes_database_with_special_chars():
+    """A database name containing special characters (e.g. a `$`) must be
+    quoted so the USE DATABASE resolves it exactly."""
+    connector = _oauth_connector(database="TEST$DB")
+    captured = _capture_connect_listener(connector)
+
+    cursor = MagicMock()
+    dbapi_connection = MagicMock()
+    dbapi_connection.cursor.return_value = cursor
+
+    captured["fn"](dbapi_connection, MagicMock())
+
+    cursor.execute.assert_called_once_with('USE DATABASE "TEST$DB"')
