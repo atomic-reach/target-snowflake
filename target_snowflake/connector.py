@@ -301,6 +301,29 @@ class SnowflakeConnector(SQLConnector):
         # Map Python's uuid.UUID to SQLAlchemy's UUID type when writing values
         engine.dialect.colspecs[uuid.UUID] = sqlalchemy.types.Uuid
 
+        # Force the session's current database on every pooled connection.
+        #
+        # The connect-time `database` is only a soft request: Snowflake sets the
+        # current database from it only if the active role can resolve it. With a
+        # role-scoped OAuth token (scope `session:role:<role>`) that has no default
+        # namespace, that request can be silently dropped — the session then has no
+        # current database, and the unqualified DDL this target emits
+        # (`CREATE TABLE "<schema>"."<table>"`, no database prefix) fails with
+        # `090105: ... does not have a current database`. Issuing an explicit
+        # `USE DATABASE` after the role is established makes the context
+        # deterministic; if the role genuinely can't access the database it fails
+        # loudly here instead of as a confusing 090105 later.
+        preparer = SnowflakeIdentifierPreparer(SnowflakeDialect())
+        quoted_database = preparer.quote(self.config["database"])
+
+        @sqlalchemy.event.listens_for(engine, "connect")
+        def _use_database(dbapi_connection, connection_record) -> None:  # noqa: ANN001, ARG001
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute(f"USE DATABASE {quoted_database}")
+            finally:
+                cursor.close()
+
         with engine.connect() as conn:
             db_names = [db[1] for db in conn.execute(text("SHOW DATABASES;")).fetchall()]
             if self.config["database"] not in db_names:
